@@ -1,17 +1,114 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+gen_dashboard.py
+================
+Gera o arquivo dashboard_mege.html a partir de tickets_etiquetados_mege_completo.xlsx.
+
+Uso:
+    pip install openpyxl
+    python gen_dashboard.py
+
+Saída:
+    dashboard_mege.html  (~4 MB, standalone, abre direto no navegador)
+
+─────────────────────────────────────────────────────────
+PROCESSO DE INVESTIGAÇÃO E DECISÕES DE DESIGN
+─────────────────────────────────────────────────────────
+
+1. DIAGNÓSTICO INICIAL
+   O arquivo fonte tinha 4.626 linhas e 22 colunas. Campos relevantes:
+   - Etiquetados por IA: tipo_solicitacao, material_referenciado, carreira,
+     materia, confianca, nota_ambiguidade
+   - Classificação original do sistema: tipo_suporte (7 categorias humanas,
+     diferente da taxonomia da IA)
+   - Dados do aluno: nome_aluno, email_aluno (não embarcados no dashboard
+     por privacidade — apenas id_aluno é preservado via campo `id`)
+
+2. IDENTIFICAÇÃO DE DUPLICATAS
+   Ao cruzar os IDs (UUID v4), descobriu-se que o banco continha 408 linhas
+   duplicadas — o mesmo ticket aparecia 2x, 3x ou até 4x no arquivo.
+
+   Diagnóstico detalhado:
+     Total de linhas brutas : 4.626
+     IDs únicos             : 4.218
+     IDs duplicados         :   398  (aparecem 2x ou mais)
+     Linhas redundantes     :   408  (removidas)
+
+   Causa provável: exportação com JOIN sem DISTINCT ou múltiplas inserções
+   no banco de origem.
+
+   Solução: `seen_ids = set()` — na primeira ocorrência de cada ID o registro
+   é processado; nas seguintes, `continue` pula para a próxima linha.
+   Isso garante que o dashboard sempre reflita 4.218 tickets únicos.
+
+   Para auditar os duplicados isoladamente, use o script abaixo:
+
+       from collections import Counter
+       import openpyxl
+       wb = openpyxl.load_workbook('tickets_etiquetados_mege_completo.xlsx', read_only=True)
+       ws = wb.active
+       headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+       ids = [dict(zip(headers, r)).get('id','') for r in ws.iter_rows(min_row=2, values_only=True)]
+       duplicados = {k: v for k, v in Counter(ids).items() if v > 1}
+       # duplicados = {uuid: n_ocorrencias, ...}  →  398 entradas
+
+3. CAMPOS DERIVADOS
+   a) `fase` — não existia no banco. Derivada do campo `turma` por matching
+      de substrings (case-insensitive). Ver função derive_fase() abaixo.
+
+   b) `turma_clean` — nome original tinha conteúdo entre parênteses muito
+      longo (ex: "TJSP 192, 2ª Fase (Turma 1: Materiais, videoaulas e
+      correções por magistrados)"). Removido via regex e truncado em 50 chars.
+
+   c) `dia`, `mes`, `semana`, `dow` — extraídos de data_criacao para
+      alimentar os gráficos de evolução temporal e dia da semana.
+
+4. CAMPO tipo_suporte
+   Descoberto durante investigação: além das tags de IA (tipo_solicitacao),
+   o banco tinha uma classificação humana original (tipo_suporte) com
+   categorias diferentes. Adicionado como filtro independente em todas as
+   abas para permitir cruzamento entre classificação humana e IA.
+
+5. ESTRUTURA DOS ARRAYS EMBARCADOS
+   Para manter o HTML abaixo de 6 MB, os dados são divididos em dois arrays:
+
+   FD (Filter Data) — 12 campos por linha, ~700 KB:
+     [0] data          [1] tipo_solicitacao  [2] carreira
+     [3] fase          [4] materia           [5] material_referenciado
+     [6] turma         [7] status            [8] mes
+     [9] semana        [10] dow              [11] tipo_suporte
+
+   DD (Detail Data) — 17 campos por linha, ~3.3 MB:
+     [0] data          [1] titulo            [2] tipo_solicitacao
+     [3] carreira      [4] fase              [5] materia
+     [6] material      [7] turma             [8] status
+     [9] coordenador   [10] confianca        [11] descricao (max 800 chars)
+     [12] resposta     [13] nota_ambiguidade [14] mes
+     [15] tipo_suporte [16] id
+"""
+
 import openpyxl, json, re
 from datetime import datetime
 
 wb = openpyxl.load_workbook('tickets_etiquetados_mege_completo.xlsx', read_only=True)
 ws = wb.active
 
+
 def clean_turma(t):
+    """Remove conteúdo entre parênteses do nome da turma e trunca em 50 chars.
+    Ex: 'TJSP 192, 2ª Fase (Turma 1: Materiais...)' → 'TJSP 192, 2ª Fase'
+    """
     if not t: return 'Sem turma'
     t = re.sub(r'\s*\([^)]*\)', '', str(t)).strip()
     return t[:50] if len(t) > 50 else t
 
+
 def derive_fase(turma):
+    """Deriva a fase do curso a partir do nome da turma.
+    O campo 'fase' não existe no banco — é inferido por matching de substrings.
+    Cobre variações de encoding (ª/°/a) e com/sem hífen.
+    """
     if not turma: return 'Geral'
     t = str(turma).lower()
     if any(x in t for x in ['2ª fase','2a fase','2° fase',' 2 fase','segunda fase',
@@ -29,63 +126,79 @@ def derive_fase(turma):
     if 'reta final' in t: return 'Reta Final'
     return 'Geral'
 
+
 headers = None
-rows_filter = []
-rows_full = []
+rows_filter = []   # array FD — dados para filtros e gráficos
+rows_full   = []   # array DD — dados completos para o Explorador
+
+# ─── DEDUPLICAÇÃO ────────────────────────────────────────────────────────────
+# O banco continha 408 linhas duplicadas (mesmo UUID aparecendo 2-4x).
+# seen_ids rastreia IDs já processados; registros repetidos são ignorados.
+# Resultado: 4.626 linhas brutas → 4.218 tickets únicos.
 seen_ids = set()
 
 for i, row in enumerate(ws.iter_rows(values_only=True)):
     if i == 0:
         headers = list(row)
         continue
+
     r = dict(zip(headers, row))
+
+    # ── Deduplicação por ID ──────────────────────────────────────────────────
     row_id = str(r.get('id','') or '')
     if row_id and row_id in seen_ids:
-        continue
+        continue          # duplicata — pula
     if row_id:
         seen_ids.add(row_id)
-    turma_raw = r.get('turma','') or ''
+
+    # ── Limpeza e derivação de turma/fase ───────────────────────────────────
+    turma_raw   = r.get('turma','') or ''
     turma_clean = clean_turma(turma_raw)
-    fase = derive_fase(turma_raw)
+    fase        = derive_fase(turma_raw)
+
+    # ── Derivação de campos de data ──────────────────────────────────────────
     dc = r.get('data_criacao','')
     if dc:
         try:
-            dt = dc if isinstance(dc, datetime) else datetime.fromisoformat(str(dc)[:19])
-            data = dt.strftime('%Y-%m-%d')
-            mes = dt.strftime('%Y-%m')
+            dt     = dc if isinstance(dc, datetime) else datetime.fromisoformat(str(dc)[:19])
+            data   = dt.strftime('%Y-%m-%d')
+            mes    = dt.strftime('%Y-%m')
             semana = dt.strftime('%Y-W%W')
-            dow = dt.weekday()
+            dow    = dt.weekday()          # 0=Segunda … 6=Domingo
         except:
-            data=mes=semana=''; dow=-1
+            data = mes = semana = ''; dow = -1
     else:
-        data=mes=semana=''; dow=-1
-    status = str(r.get('status','') or '').strip()
+        data = mes = semana = ''; dow = -1
 
+    status       = str(r.get('status','') or '').strip()
     tipo_sup_raw = str(r.get('tipo_suporte','') or '').strip().rstrip()
 
+    # ── Array FD (filtros e gráficos) ────────────────────────────────────────
     rows_filter.append([
         data,
-        str(r.get('tipo_solicitacao','') or ''),
-        str(r.get('carreira','') or ''),
-        fase,
-        str(r.get('materia','') or ''),
-        str(r.get('material_referenciado','') or ''),
-        turma_clean,
-        status,
-        mes,
-        semana,
-        dow,
-        tipo_sup_raw   # [11]
+        str(r.get('tipo_solicitacao','') or ''),  # [1]
+        str(r.get('carreira','') or ''),           # [2]
+        fase,                                      # [3]
+        str(r.get('materia','') or ''),            # [4]
+        str(r.get('material_referenciado','') or ''),  # [5]
+        turma_clean,                               # [6]
+        status,                                    # [7]
+        mes,                                       # [8]
+        semana,                                    # [9]
+        dow,                                       # [10]
+        tipo_sup_raw                               # [11]
     ])
 
+    # ── Array DD (explorador — dados completos) ──────────────────────────────
     titulo = str(r.get('titulo','') or '')[:200]
-    desc = re.sub(r'<[^>]+>',' ', str(r.get('descricao','') or '')).strip()[:800]
-    resp = re.sub(r'<[^>]+>',' ', str(r.get('reposta','') or '')).strip()[:800]
-    coord = str(r.get('coodenador_responsavel','') or '')
-    conf = r.get('confianca',None)
-    try: conf = round(float(conf),2) if conf is not None else None
+    # Descrições e respostas chegam com HTML — strip de tags + truncagem em 800 chars
+    desc   = re.sub(r'<[^>]+>',' ', str(r.get('descricao','') or '')).strip()[:800]
+    resp   = re.sub(r'<[^>]+>',' ', str(r.get('reposta','')   or '')).strip()[:800]
+    coord  = str(r.get('coodenador_responsavel','') or '')
+    conf   = r.get('confianca', None)
+    try:   conf = round(float(conf), 2) if conf is not None else None
     except: conf = None
-    nota = str(r.get('nota_ambiguidade','') or '')[:300] if r.get('nota_ambiguidade') else ''
+    nota   = str(r.get('nota_ambiguidade','') or '')[:300] if r.get('nota_ambiguidade') else ''
     rows_full.append([
         data,
         titulo,
